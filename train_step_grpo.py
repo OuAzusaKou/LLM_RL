@@ -5,7 +5,7 @@ from transformers import (
     default_data_collator,
 )
 from datasets import load_dataset
-from step_grpo_trainer import StepGRPOTrainer
+from step_grpo_trainer import StepGRPOTrainer,THINK_STR,ANSWER_STR
 import torch
 from typing import List
 import os
@@ -17,6 +17,9 @@ from peft import (
 )
 
 from datasets import Features, Value, Sequence
+
+# THINK_STR = '<|think|>'
+# ANSWER_STR = '<|answer|>'
 
 def setup_model_and_tokenizer(model_name: str):
     """设置模型和分词器，并应用LoRA
@@ -57,7 +60,7 @@ def setup_model_and_tokenizer(model_name: str):
 
 
 
-def reward_function(steps: List[str], answer: str) -> float:
+def reward_function(steps: List[str], answer: str,labels:str) -> float:
     """计算奖励值的函数
     
     Args:
@@ -70,7 +73,11 @@ def reward_function(steps: List[str], answer: str) -> float:
     # 这里实现您的奖励计算逻辑
     # 示例：根据步骤数和答案长度计算简单奖励
     step_reward = len(steps) * 0.1  # 每个步骤给0.1的奖励
-    answer_reward = min(len(answer) / 100, 0.5)  # 答案长度奖励，最大0.5
+    # answer_reward = min(len(answer) / 100, 0.5)  # 答案长度奖励，最大0.5
+    if answer == labels:
+        answer_reward = 1
+    else:
+        answer_reward = 0
     return step_reward + answer_reward
 
 # custom_features = Features({

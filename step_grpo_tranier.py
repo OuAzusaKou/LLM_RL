@@ -46,6 +46,8 @@ from transformers.utils import (
     logging,
     strtobool,
 )
+THINK_STR = 'Tk'
+ANSWER_STR = 'Ans'
 
 if is_apex_available():
     from apex import amp
@@ -112,13 +114,9 @@ class StepGRPOTrainer(Trainer):
             answer: 最终答案
         """
         # 分割思考步骤和答案
-        parts = text.split("answer")
-        if len(parts) != 2:
-            return [], text
-            
-        steps_text, answer = parts
-        # 分割各个思考步骤
-        steps = [step.strip() for step in steps_text.split("\\think") if step.strip()]
+        parts = text.split(ANSWER_STR)
+        answer = parts[-1]
+        steps = ''
         return steps, answer.strip()
 
     def sample_generate_and_adv_cal(self, model, inputs, return_outputs=False, num_items_in_batch=1):
@@ -136,7 +134,19 @@ class StepGRPOTrainer(Trainer):
         batch_size = input_ids.shape[0]
         
         input_str = self.tokenizer.decode(input_ids[0])
+
+        split_positions = (input_ids[0] == 151644).nonzero(as_tuple=True)[0]
+        if len(split_positions) >= 2:
+            # 获取第二个分隔符的位置
+            second_split_pos = split_positions[2]
+            # 截取前两组内容
+            input_ids = input_ids[:, :second_split_pos+3]
+            attention_mask = attention_mask[:, :second_split_pos+3]
+
+
+        
         labels = input_str.split('<|im_start|>')[3].split('assistant\n')[1].split('<|im_end|>\n')[0]
+
         total_loss = 0
         
         # 存储所有思考树的根节点
@@ -160,7 +170,7 @@ class StepGRPOTrainer(Trainer):
                 output_logits=True,
                 return_dict_in_generate=True,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=[self.tokenizer.encode("think")[0],self.tokenizer.encode("answer")[0]]
+                eos_token_id=[self.tokenizer.encode(THINK_STR)[0],self.tokenizer.encode(ANSWER_STR)[0]]
             )
 
             # logits = model(first_step_output.sequences).logits
@@ -191,10 +201,10 @@ class StepGRPOTrainer(Trainer):
                     current_text = current_node.text
                     
                     # 如果当前文本已包含answer或达到最大步数，则生成答案
-                    if "answer" in current_text[len(query_texts):] or len(current_text[len(query_texts):].split("think")) >= self.max_steps:
+                    if ANSWER_STR in current_text[len(query_texts):] or len(current_text[len(query_texts):].split(THINK_STR)) >= self.max_steps:
                         # 生成最终答案
                         final_input_ids = self.tokenizer.encode(
-                            current_text + "answer",
+                            current_text + ANSWER_STR,
                             return_tensors="pt",
                             add_special_tokens=False
                         ).to(input_ids.device)
@@ -208,7 +218,7 @@ class StepGRPOTrainer(Trainer):
                             output_logits=True,
                             return_dict_in_generate=True,
                             pad_token_id=self.tokenizer.pad_token_id,
-                            eos_token_id=[self.tokenizer.encode("think")[0],self.tokenizer.encode("answer")[0]]
+                            eos_token_id=[self.tokenizer.encode(THINK_STR)[0],self.tokenizer.encode(ANSWER_STR)[0]]
                         )
                         final_scores = final_output.logits
 
@@ -229,14 +239,14 @@ class StepGRPOTrainer(Trainer):
                             
                             answer_node.is_answer = True
                             
-                            answer_node.labels = labels[i]
+                            answer_node.labels = labels
 
                             current_node.add_child(answer_node)
                         
                         continue
                     
                     # 准备输入
-                    if current_text.endswith("think"):
+                    if current_text.endswith(THINK_STR):
                         current_input_ids = self.tokenizer.encode(
                             current_text,
                             return_tensors="pt",
@@ -244,7 +254,7 @@ class StepGRPOTrainer(Trainer):
                         ).to(input_ids.device)
                     else:
                         current_input_ids = self.tokenizer.encode(
-                            current_text+'think',
+                            current_text+THINK_STR,
                             return_tensors="pt",
                             add_special_tokens=False
                         ).to(input_ids.device)
@@ -259,7 +269,7 @@ class StepGRPOTrainer(Trainer):
                         output_logits=True,
                         return_dict_in_generate=True,
                         pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=[self.tokenizer.encode("think")[0], self.tokenizer.encode("answer")[0]]
+                        eos_token_id=[self.tokenizer.encode(THINK_STR)[0], self.tokenizer.encode(ANSWER_STR)[0]]
                     )
                     
                     
@@ -408,7 +418,11 @@ class StepGRPOTrainer(Trainer):
                     # loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
                     node_num += 1
                     loss = self.compute_node_loss(model,node)
-                    print(loss)
+
+                        
+                    # 或者方式3：同时检查
+                    if not loss.requires_grad:
+                        continue
                 # 
                 if (
                     self.args.torch_empty_cache_steps is not None
@@ -534,7 +548,7 @@ class StepGRPOTrainer(Trainer):
             output_scores=True,
             return_dict_in_generate=True,
             pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=[self.tokenizer.encode("think")[0],self.tokenizer.encode("answer")[0]]
+            eos_token_id=[self.tokenizer.encode(THINK_STR)[0],self.tokenizer.encode(ANSWER_STR)[0]]
         )
         
         first_step_texts = self.tokenizer.batch_decode(first_step_output.sequences, skip_special_tokens=True)
