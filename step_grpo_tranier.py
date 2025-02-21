@@ -46,11 +46,14 @@ from transformers.utils import (
     logging,
     strtobool,
 )
-THINK_STR = 'Tk'
-ANSWER_STR = 'Ans'
+THINK_STR_START = '<think>'
+THINK_STR_END = '</think>'
+ANSWER_STR_START = '<tool_call>'
+ANSWER_STR_END = '</tool_call>'
 
 if is_apex_available():
     from apex import amp
+import datetime
 
 class ThoughtNode:
     """思考树的节点类"""
@@ -102,22 +105,89 @@ class StepGRPOTrainer(Trainer):
         self.num_samples = num_samples
         self.max_steps = max_steps
         self.max_generate_tokens = max_generate_tokens
+        
+        # 创建日志文件
+        self.log_file = open('training_loss.log', 'a')
 
-    def _parse_generation(self, text: str) -> Tuple[List[str], str]:
-        """解析生成的文本，分离思考步骤和最终答案
+    def __del__(self):
+        """析构函数，确保日志文件被正确关闭"""
+        if hasattr(self, 'log_file'):
+            self.log_file.close()
+
+    def _parse_generation(self, text: str) -> Tuple[List[str], List[str], List[str]]:
+        """解析生成的文本，分离思考步骤、最终答案和其他文本
         
         Args:
             text: 生成的文本
             
         Returns:
             steps: 思考步骤列表
-            answer: 最终答案
+            answers: 最终答案列表
+            others: 非匹配部分和嵌套文本列表
         """
-        # 分割思考步骤和答案
-        parts = text.split(ANSWER_STR)
-        answer = parts[-1]
-        steps = ''
-        return steps, answer.strip()
+        # 初始化结果列表
+        steps = []
+        answers = []
+        others = []
+        
+        # 记录当前处理位置
+        current_pos = 0
+        
+        # 按顺序找出所有标记
+        all_matches = []
+        
+        # 查找所有思考步骤
+        think_pattern = f'{THINK_STR_START}.*?{THINK_STR_END}'
+        think_matches = list(re.finditer(think_pattern, text, re.DOTALL))
+        for match in think_matches:
+            all_matches.append(('think', match.start(), match.end(), match.group()))
+        
+        # 查找答案部分
+        answer_pattern = f'{ANSWER_STR_START}.*?{ANSWER_STR_END}'
+        answer_matches = list(re.finditer(answer_pattern, text, re.DOTALL))
+        for match in answer_matches:
+            all_matches.append(('answer', match.start(), match.end(), match.group()))
+        
+        # 按开始位置排序
+        all_matches.sort(key=lambda x: x[1])
+        
+        # 处理所有匹配
+        stack = []  # 用于处理嵌套
+        for match_type, start, end, content in all_matches:
+            # 检查非匹配部分
+            if current_pos < start:
+                non_match = text[current_pos:start].strip()
+                if non_match:
+                    others.append(non_match)
+            
+            # 检查嵌套
+            while stack and stack[-1][2] < start:
+                _, _, prev_end = stack.pop()
+                if current_pos < prev_end:
+                    current_pos = prev_end
+            
+            # 如果存在嵌套
+            if stack:
+                nested = text[start:end].strip()
+                if nested:
+                    others.append(nested)
+            else:
+                # 不是嵌套的情况，正常添加到对应列表
+                if match_type == 'think':
+                    steps.append(content)
+                else:
+                    answers.append(content)
+            
+            stack.append((match_type, start, end))
+            current_pos = end
+        
+        # 检查最后的非匹配部分
+        if current_pos < len(text):
+            final_non_match = text[current_pos:].strip()
+            if final_non_match:
+                others.append(final_non_match)
+        
+        return steps, answers, others
 
     def sample_generate_and_adv_cal(self, model, inputs, return_outputs=False, num_items_in_batch=1):
         """计算训练损失，每一步都进行多次采样
@@ -135,17 +205,17 @@ class StepGRPOTrainer(Trainer):
         
         input_str = self.tokenizer.decode(input_ids[0])
 
-        split_positions = (input_ids[0] == 151644).nonzero(as_tuple=True)[0]
-        if len(split_positions) >= 2:
-            # 获取第二个分隔符的位置
-            second_split_pos = split_positions[2]
-            # 截取前两组内容
-            input_ids = input_ids[:, :second_split_pos+3]
-            attention_mask = attention_mask[:, :second_split_pos+3]
+        # split_positions = (input_ids[0] == 151644).nonzero(as_tuple=True)[0]
+        # if len(split_positions) >= 2:
+        #     # 获取第二个分隔符的位置
+        #     second_split_pos = split_positions[2]
+        #     # 截取前两组内容
+        #     input_ids = input_ids[:, :second_split_pos+3]
+        #     attention_mask = attention_mask[:, :second_split_pos+3]
 
 
         
-        labels = input_str.split('<|im_start|>')[3].split('assistant\n')[1].split('<|im_end|>\n')[0]
+        # labels = input_str.split('<|im_start|>')[3].split('assistant\n')[1].split('<|im_end|>\n')[0]
 
         total_loss = 0
         
@@ -157,7 +227,7 @@ class StepGRPOTrainer(Trainer):
             sample_input_ids = input_ids[i,:].view(1,-1)
             sample_attention_mask = attention_mask[i,:].view(1,-1)
             
-            query_texts = self.tokenizer.decode(sample_input_ids[0], skip_special_tokens=True)
+            query_texts = self.tokenizer.decode(sample_input_ids[0], skip_special_tokens=False)
             
             # 生成第一步的多个样本
             first_step_output = model.generate(
@@ -170,14 +240,14 @@ class StepGRPOTrainer(Trainer):
                 output_logits=True,
                 return_dict_in_generate=True,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=[self.tokenizer.encode(THINK_STR)[0],self.tokenizer.encode(ANSWER_STR)[0]]
+                eos_token_id=[self.tokenizer.encode(THINK_STR_START,add_special_tokens=False)[0],self.tokenizer.encode(ANSWER_STR_START,add_special_tokens=False)[0],self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[0]]
             )
 
             # logits = model(first_step_output.sequences).logits
             
             # grad_logits = logits[:, :-1, :]
             
-            first_step_texts = self.tokenizer.batch_decode(first_step_output.sequences, skip_special_tokens=True)
+            first_step_texts = self.tokenizer.batch_decode(first_step_output.sequences, skip_special_tokens=False)
             
             first_scores = first_step_output.logits
 
@@ -201,14 +271,22 @@ class StepGRPOTrainer(Trainer):
                     current_text = current_node.text
                     
                     # 如果当前文本已包含answer或达到最大步数，则生成答案
-                    if ANSWER_STR in current_text[len(query_texts):] or len(current_text[len(query_texts):].split(THINK_STR)) >= self.max_steps:
+                    if (ANSWER_STR_START in current_text[len(query_texts):]) or (len(current_text[len(query_texts):].split(THINK_STR_END)) >= self.max_steps) \
+                        or (len(current_text[len(query_texts):]) > 1600):
                         # 生成最终答案
-                        final_input_ids = self.tokenizer.encode(
-                            current_text + ANSWER_STR,
-                            return_tensors="pt",
-                            add_special_tokens=False
-                        ).to(input_ids.device)
-                        
+                        if current_text.endswith(ANSWER_STR_START):
+                            final_input_ids = self.tokenizer.encode(
+                                current_text,
+                                return_tensors="pt",
+                                add_special_tokens=False
+                                ).to(input_ids.device)
+                        else:
+                            final_input_ids = self.tokenizer.encode(
+                                current_text + ANSWER_STR_START,
+                                return_tensors="pt",
+                                add_special_tokens=False
+                            ).to(input_ids.device)
+
                         final_output = model.generate(
                             input_ids=final_input_ids,
                             max_new_tokens=self.max_generate_tokens,
@@ -218,7 +296,7 @@ class StepGRPOTrainer(Trainer):
                             output_logits=True,
                             return_dict_in_generate=True,
                             pad_token_id=self.tokenizer.pad_token_id,
-                            eos_token_id=[self.tokenizer.encode(THINK_STR)[0],self.tokenizer.encode(ANSWER_STR)[0]]
+                            eos_token_id=[self.tokenizer.encode(ANSWER_STR_END,add_special_tokens=False)[0],self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[0]]
                         )
                         final_scores = final_output.logits
 
@@ -226,7 +304,7 @@ class StepGRPOTrainer(Trainer):
             
                         # grad_logits = logits[:, :-1, :]
 
-                        final_texts = self.tokenizer.batch_decode(final_output.sequences, skip_special_tokens=True)
+                        final_texts = self.tokenizer.batch_decode(final_output.sequences, skip_special_tokens=False)
                         final_input_length = final_input_ids.shape[1]
                         # 为每个答案创建叶子节点
                         for sample_num, final_text in enumerate(final_texts):
@@ -246,7 +324,7 @@ class StepGRPOTrainer(Trainer):
                         continue
                     
                     # 准备输入
-                    if current_text.endswith(THINK_STR):
+                    if current_text.endswith(THINK_STR_START):
                         current_input_ids = self.tokenizer.encode(
                             current_text,
                             return_tensors="pt",
@@ -254,7 +332,7 @@ class StepGRPOTrainer(Trainer):
                         ).to(input_ids.device)
                     else:
                         current_input_ids = self.tokenizer.encode(
-                            current_text+THINK_STR,
+                            current_text+THINK_STR_START,
                             return_tensors="pt",
                             add_special_tokens=False
                         ).to(input_ids.device)
@@ -269,7 +347,7 @@ class StepGRPOTrainer(Trainer):
                         output_logits=True,
                         return_dict_in_generate=True,
                         pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=[self.tokenizer.encode(THINK_STR)[0], self.tokenizer.encode(ANSWER_STR)[0]]
+                        eos_token_id=[self.tokenizer.encode(THINK_STR_START,add_special_tokens=False)[0], self.tokenizer.encode(ANSWER_STR_START,add_special_tokens=False)[0],self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[0]]
                     )
                     
                     
@@ -278,7 +356,7 @@ class StepGRPOTrainer(Trainer):
                     # grad_logits = logits[:, :-1, :]
 
 
-                    next_texts = self.tokenizer.batch_decode(next_outputs.sequences, skip_special_tokens=True)
+                    next_texts = self.tokenizer.batch_decode(next_outputs.sequences, skip_special_tokens=False)
 
                     current_scores = next_outputs.logits
                     current_input_length = current_input_ids.shape[1]
@@ -299,9 +377,16 @@ class StepGRPOTrainer(Trainer):
                         # 到达叶子节点，计算整条路径的损失
                         path_text = node.text
                         path_outputs = accumulated_outputs + [node.output]
-                        steps, answer = self._parse_generation(path_text)
-                        reward = self.reward_function(steps, answer, node.labels) 
-                        node.value = reward    
+                        steps, answer,others = self._parse_generation(path_text)
+                        reward = self.reward_function(steps, answer, others,node.labels) 
+                        node.value = reward
+
+                        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        # 记录loss到日志文件
+                        self.log_file.write(f"{current_time} - Reward: {reward}\n")
+                        self.log_file.flush()  # 确保立即写入文件
+
+
                         return reward
                     
                     else:
@@ -311,16 +396,16 @@ class StepGRPOTrainer(Trainer):
                         # else:
                         #     input_text = node.text + "think"
                         
-                        input_code = node.output
-                        # 获取当前节点的输入ID
-                        input_code_length = len(self.tokenizer.encode(node.text, add_special_tokens=False))
+                        # input_code = node.output
+                        # # 获取当前节点的输入ID
+                        # input_code_length = len(self.tokenizer.encode(node.text, add_special_tokens=False))
                         # 获取模型对所有子节点文本的概率输出
                         # with torch.no_grad():
-                        node_logits = node.score
+                        # node_logits = node.score
 
-                        node_logits = torch.stack(node_logits, dim=0)
+                        # node_logits = torch.stack(node_logits, dim=0)
                         # logits = logits[:, -1, :]  # 获取最后一个token的logits
-                        node_probs = torch.nn.functional.softmax(node_logits, dim=-1)
+                        # node_probs = torch.nn.functional.softmax(node_logits, dim=-1)
                         
                         # 计算每个子节点的条件概率并更新value
                         for child in node.children:
@@ -394,9 +479,11 @@ class StepGRPOTrainer(Trainer):
             `torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
+        torch.cuda.empty_cache()
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
             self.optimizer.train()
 
+        self.optimizer.zero_grad()
         inputs = self._prepare_inputs(inputs)
         # if is_sagemaker_mp_enabled():
         #     loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
@@ -421,8 +508,7 @@ class StepGRPOTrainer(Trainer):
 
                         
                     # 或者方式3：同时检查
-                    if not loss.requires_grad:
-                        continue
+
                 # 
                 if (
                     self.args.torch_empty_cache_steps is not None
@@ -442,7 +528,8 @@ class StepGRPOTrainer(Trainer):
                         torch.cuda.empty_cache()
 
                 kwargs = {}
-
+                if not loss.requires_grad:
+                    continue
                 # For LOMO optimizers you need to explicitly use the learnign rate
                 if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
                     kwargs["learning_rate"] = self._get_learning_rate()
@@ -459,7 +546,22 @@ class StepGRPOTrainer(Trainer):
                         loss = loss / self.args.gradient_accumulation_steps
 
                     self.accelerator.backward(loss, **kwargs)
+            # 在计算完loss后记录到日志文件
+                # 获取当前时间
+                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # 记录loss到日志文件
+                self.log_file.write(f"{current_time} - Loss: {loss.detach().item()}\n")
+                self.log_file.flush()  # 确保立即写入文件
 
+            
+        
+
+        # print(loss)
+        # 在训练步骤结束时销毁所有树
+        for tree in trees:
+            destroy_tree(tree)
+        del trees
+        
         return loss.detach()
     
     def compute_node_loss(self, model, node):
@@ -649,3 +751,26 @@ def compute_advantage(node):
     # 递归计算所有子节点的advantage
     for child in node.children:
         compute_advantage(child)
+
+def destroy_tree(tree):
+    """销毁树中的所有节点
+    
+    Args:
+        tree: 树的根节点
+    """
+    if not tree:
+        return
+        
+    node_queue = [tree]
+    while node_queue:
+        current_node = node_queue.pop(0)
+        # 将子节点加入队列
+        node_queue.extend(current_node.children)
+        
+        # 清除节点的引用
+        current_node.children = []
+        current_node.parent = None
+        current_node.output = None
+        current_node.score = None
+        current_node.text = None
+        current_node.labels = None

@@ -5,7 +5,7 @@ from transformers import (
     default_data_collator,
 )
 from datasets import load_dataset
-from step_grpo_trainer import StepGRPOTrainer,THINK_STR,ANSWER_STR
+from step_grpo_trainer import StepGRPOTrainer,THINK_STR_START,THINK_STR_END,ANSWER_STR_START,ANSWER_STR_END
 import torch
 from typing import List
 import os
@@ -17,9 +17,6 @@ from peft import (
 )
 
 from datasets import Features, Value, Sequence
-
-# THINK_STR = '<|think|>'
-# ANSWER_STR = '<|answer|>'
 
 def setup_model_and_tokenizer(model_name: str):
     """设置模型和分词器，并应用LoRA
@@ -60,7 +57,7 @@ def setup_model_and_tokenizer(model_name: str):
 
 
 
-def reward_function(steps: List[str], answer: str,labels:str) -> float:
+def reward_function(steps: List[str], answer: List[str], others: List[str], labels: str) -> float:
     """计算奖励值的函数
     
     Args:
@@ -74,11 +71,25 @@ def reward_function(steps: List[str], answer: str,labels:str) -> float:
     # 示例：根据步骤数和答案长度计算简单奖励
     step_reward = len(steps) * 0.1  # 每个步骤给0.1的奖励
     # answer_reward = min(len(answer) / 100, 0.5)  # 答案长度奖励，最大0.5
-    if answer == labels:
-        answer_reward = 1
+    if len(steps) >= 4:
+        step_reward = 1
     else:
-        answer_reward = 0
-    return step_reward + answer_reward
+        step_reward = 0
+    other_reward = 0
+    for i in range(4,len(others)):
+        other_reward_buf = len(others[i]) * 0.05
+        if abs(other_reward_buf) > 0.5:
+            other_reward_buf =  - 0.5
+        other_reward += other_reward_buf
+
+    answer_reward = 0
+    if len(answer) > 2:
+        answer_reward = 2
+    if answer[-1] == labels:
+        answer_reward += 10
+    
+
+    return step_reward + answer_reward + other_reward
 
 # custom_features = Features({
 #     'input_ids': Sequence(Value('int32')),  # 输入ID序列
@@ -92,14 +103,14 @@ def tokenize_function(example, tokenizer, max_length=512):
     """自定义数据处理函数 - 单样本处理版本"""
     # 获取对话
     conversation = example['text']
-    
+
     # 分离输入消息
     input_messages = conversation[:2]  # system和user消息
     label_message = conversation[2]    # assistant消息
     
     # 处理输入部分
     input_tokens = tokenizer.apply_chat_template(
-        [conversation],
+        [input_messages],
         return_tensors="pt",
         add_generation_prompt=True,
         return_dict=True,
@@ -115,7 +126,7 @@ def tokenize_function(example, tokenizer, max_length=512):
         "input_ids": input_tokens['input_ids'][0],
         "attention_mask": input_tokens['attention_mask'][0],
         # "label": content  # 原始答案文本
-        "la":content
+        "labels":content
     }
 
 def custom_data_collator(features):
@@ -128,9 +139,9 @@ def custom_data_collator(features):
         features = [features]
         
     # 收集batch中的所有样本
-    input_ids = torch.stack([f["input_ids"] for f in features])
-    attention_mask = torch.stack([f["attention_mask"] for f in features])
-    labels = [f["la"] for f in features]  # 保持原始文本格式
+    input_ids = torch.stack([torch.tensor(f["input_ids"]) for f in features])
+    attention_mask = torch.stack([torch.tensor(f["attention_mask"]) for f in features])
+    labels = [f["labels"] for f in features]  # 保持原始文本格式
     
     # 构建batch
     batch = {
@@ -143,7 +154,7 @@ def custom_data_collator(features):
 
 def main():
     # 配置参数
-    model_name = "../../Qwen2.5-7B-Instruct"
+    model_name =  "../../DeepSeek-R1-Distill-Qwen-7B/" #"/home/ps/.cache/huggingface/hub/models--agentica-org--DeepScaleR-1.5B-Preview/snapshots/24a92eff29154a702a928249812162644208ac5b/"
     output_dir = "output"
     num_train_epochs = 3
     per_device_train_batch_size = 1
@@ -160,8 +171,8 @@ def main():
     model, tokenizer = setup_model_and_tokenizer(model_name)
     
     # 加载数据集
-    train_data = 'math_test_data.json'
-    test_data = 'math_training_data.json'
+    train_data = 'math_training_data.json'#'/home/ps/Documents/deepscaler/LLM_RL/math_training_data.json'
+    test_data = 'math_test_data.json'#'/home/ps/Documents/deepscaler/LLM_RL/math_test_data.json'
 
     # 加载数据集时禁用缓存
     dataset = load_dataset(
@@ -207,7 +218,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset['train'],
         tokenizer=tokenizer,
-        # data_collator=custom_data_collator,  # 使用自定义的data_collator
+        data_collator=custom_data_collator,  # 使用自定义的data_collator
     )
     
     # 测试生成过程
