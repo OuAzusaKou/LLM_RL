@@ -70,8 +70,53 @@ def parse_args():
     # 添加deepspeed参数
     parser = deepspeed.add_config_arguments(parser)
     
+    # 在parse_args函数中添加新的参数
+    training_args.add_argument('--focus_tokens', type=str, nargs='+', default=[],
+                      help='需要重点关注的token列表')
+    training_args.add_argument('--focus_weight', type=float, default=2.0,
+                      help='重点token附近的loss权重')
+    training_args.add_argument('--context_window', type=int, default=5,
+                      help='重点token影响的上下文窗口大小')
+    
     args = parser.parse_args()
     return args
+
+# 在main函数之前添加自定义训练器
+class WeightedLossTrainer(Trainer):
+    def __init__(self, focus_tokens, focus_weight, context_window, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 将focus_tokens转换为token_ids
+        self.focus_token_ids = []
+        for token in focus_tokens:
+            ids = self.tokenizer(token, add_special_tokens=False)['input_ids']
+            self.focus_token_ids.extend(ids)
+        self.focus_weight = focus_weight
+        self.context_window = context_window
+        
+    def compute_loss(self, model, inputs, return_outputs=False):
+        outputs = model(**inputs)
+        logits = outputs.logits
+        labels = inputs["labels"]
+        
+        # 创建权重矩阵
+        weights = torch.ones_like(labels, dtype=torch.float)
+        
+        # 在batch中查找focus_tokens
+        for b in range(labels.shape[0]):  # 遍历batch
+            for pos in range(labels.shape[1]):  # 遍历序列
+                if labels[b, pos] in self.focus_token_ids:
+                    # 为目标token周围的上下文应用权重
+                    start = max(0, pos - self.context_window)
+                    end = min(labels.shape[1], pos + self.context_window + 1)
+                    weights[b, start:end] = self.focus_weight
+        
+        # 计算加权损失
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        loss = loss.view(labels.shape) * weights
+        loss = loss.mean()
+        
+        return (loss, outputs) if return_outputs else loss
 
 def main():
     args = parse_args()
@@ -173,13 +218,17 @@ def main():
         ddp_backend="nccl",
     )
 
-    # 初始化Trainer
-    trainer = Trainer(
+    # 使用自定义训练器替换原有的Trainer
+    trainer = WeightedLossTrainer(
+        focus_tokens=args.focus_tokens,
+        focus_weight=args.focus_weight,
+        context_window=args.context_window,
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["test"],  # 将test_dataset改为eval_dataset
+        eval_dataset=tokenized_dataset["test"],
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        tokenizer=tokenizer,  # 需要添加tokenizer
     )
 
     # 开始训练

@@ -1,3 +1,4 @@
+import numpy as np
 from transformers import Trainer
 import torch
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -48,12 +49,20 @@ from transformers.utils import (
 )
 THINK_STR_START = '<think>'
 THINK_STR_END = '</think>'
-ANSWER_STR_START = '<tool_call>'
-ANSWER_STR_END = '</tool_call>'
+ANSWER_STR_START = '\\boxed{'
+ANSWER_STR_END = '}'
 
 if is_apex_available():
     from apex import amp
 import datetime
+from transformers import AutoModelForCausalLM
+import copy
+
+
+from transformers import StoppingCriteria, StoppingCriteriaList
+
+
+
 
 class ThoughtNode:
     """思考树的节点类"""
@@ -92,22 +101,39 @@ def get_per_token_logps(model, input_ids, num_logits_to_keep):
 
 
 class StepGRPOTrainer(Trainer):
-    def __init__(self, reward_function, num_samples=5, max_steps=5, max_generate_tokens=100,*args, **kwargs):
+    def __init__(self, reward_function, num_samples=5, max_steps=5, max_generate_tokens=100, kl_coef=0,*args, **kwargs):
         """初始化训练器
         
         Args:
             reward_function: 奖励计算函数
             num_samples: 每步采样次数
             max_steps: 最大步骤数
+            kl_coef: KL散度的权重系数
         """
         super().__init__(*args, **kwargs)
         self.reward_function = reward_function
         self.num_samples = num_samples
         self.max_steps = max_steps
         self.max_generate_tokens = max_generate_tokens
+        self.kl_coef = kl_coef
         
         # 创建日志文件
         self.log_file = open('training_loss.log', 'a')
+        
+        # 加载reference模型
+        if kl_coef != 0:
+            print("Creating reference model...")
+            # 深度复制当前模型
+            self.ref_model = copy.deepcopy(self.model)
+            
+            # 冻结reference模型
+            for param in self.ref_model.parameters():
+                param.requires_grad = False
+            self.ref_model.eval()
+
+        self.answer_start_sequence = [self.tokenizer.encode(ANSWER_STR_START,add_special_tokens=False)[0],
+                             self.tokenizer.encode(ANSWER_STR_START,add_special_tokens=False)[1],
+                             self.tokenizer.encode(ANSWER_STR_START,add_special_tokens=False)[2]]
 
     def __del__(self):
         """析构函数，确保日志文件被正确关闭"""
@@ -130,8 +156,11 @@ class StepGRPOTrainer(Trainer):
         answers = []
         others = []
         
-        # 记录当前处理位置
-        current_pos = 0
+        # 找到第一个"assistant\n"后的文本
+        assistant_start = text.find("assistant\n")
+        if assistant_start != -1:
+            # 从assistant后开始处理文本
+            text = text[assistant_start + len("assistant\n"):]
         
         # 按顺序找出所有标记
         all_matches = []
@@ -143,7 +172,7 @@ class StepGRPOTrainer(Trainer):
             all_matches.append(('think', match.start(), match.end(), match.group()))
         
         # 查找答案部分
-        answer_pattern = f'{ANSWER_STR_START}.*?{ANSWER_STR_END}'
+        answer_pattern = r'\\boxed'+f'.*?{ANSWER_STR_END}'
         answer_matches = list(re.finditer(answer_pattern, text, re.DOTALL))
         for match in answer_matches:
             all_matches.append(('answer', match.start(), match.end(), match.group()))
@@ -151,37 +180,24 @@ class StepGRPOTrainer(Trainer):
         # 按开始位置排序
         all_matches.sort(key=lambda x: x[1])
         
-        # 处理所有匹配
-        stack = []  # 用于处理嵌套
+        # 按顺序处理所有匹配项
+        current_pos = 0
         for match_type, start, end, content in all_matches:
-            # 检查非匹配部分
+            # 检查非匹配部分并加入到others
             if current_pos < start:
                 non_match = text[current_pos:start].strip()
                 if non_match:
                     others.append(non_match)
             
-            # 检查嵌套
-            while stack and stack[-1][2] < start:
-                _, _, prev_end = stack.pop()
-                if current_pos < prev_end:
-                    current_pos = prev_end
-            
-            # 如果存在嵌套
-            if stack:
-                nested = text[start:end].strip()
-                if nested:
-                    others.append(nested)
+            # 根据类型将内容添加到对应列表
+            if match_type == 'think':
+                steps.append(content)
             else:
-                # 不是嵌套的情况，正常添加到对应列表
-                if match_type == 'think':
-                    steps.append(content)
-                else:
-                    answers.append(content)
+                answers.append(content)
             
-            stack.append((match_type, start, end))
             current_pos = end
         
-        # 检查最后的非匹配部分
+        # 处理最后的非匹配部分
         if current_pos < len(text):
             final_non_match = text[current_pos:].strip()
             if final_non_match:
@@ -189,7 +205,7 @@ class StepGRPOTrainer(Trainer):
         
         return steps, answers, others
 
-    def sample_generate_and_adv_cal(self, model, inputs, return_outputs=False, num_items_in_batch=1):
+    def sample_generate_and_adv_cal(self, model, inputs, return_outputs=False, num_items_in_batch=1,exploration_sample_flag=False):
         """计算训练损失，每一步都进行多次采样
         
         Args:
@@ -202,8 +218,12 @@ class StepGRPOTrainer(Trainer):
         attention_mask = inputs.get("attention_mask")
         labels = inputs.get("labels")
         batch_size = input_ids.shape[0]
+        if exploration_sample_flag:
+            exploration_sample = []
+            for i in range(batch_size):
+                exploration_sample.append(inputs.get("exploration_sample")[i])
         
-        input_str = self.tokenizer.decode(input_ids[0])
+        # input_str = self.tokenizer.decode(input_ids[0])
 
         # split_positions = (input_ids[0] == 151644).nonzero(as_tuple=True)[0]
         # if len(split_positions) >= 2:
@@ -229,7 +249,11 @@ class StepGRPOTrainer(Trainer):
             
             query_texts = self.tokenizer.decode(sample_input_ids[0], skip_special_tokens=False)
             
+            r_node = ThoughtNode(query_texts, sample_input_ids[0], 0,len(sample_input_ids[0]))
+
+
             # 生成第一步的多个样本
+            # attention_mask在generate中得效果是什么？后续并未使用。
             first_step_output = model.generate(
                 input_ids=sample_input_ids,
                 attention_mask=sample_attention_mask,
@@ -240,21 +264,30 @@ class StepGRPOTrainer(Trainer):
                 output_logits=True,
                 return_dict_in_generate=True,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=[self.tokenizer.encode(THINK_STR_START,add_special_tokens=False)[0],self.tokenizer.encode(ANSWER_STR_START,add_special_tokens=False)[0],self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[0]]
+                stopping_criteria=StoppingCriteriaList([
+                            SequenceStoppingCriteria(self.answer_start_sequence)
+                        ]),
+                eos_token_id=[self.tokenizer.encode(THINK_STR_START,add_special_tokens=False)[-1],
+                              self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[-1],151643]
             )
-
+            if exploration_sample_flag:
+                # to list append(exploration_sample_information)
+                first_step_output = exploration_sample[i]
             # logits = model(first_step_output.sequences).logits
             
             # grad_logits = logits[:, :-1, :]
             
             first_step_texts = self.tokenizer.batch_decode(first_step_output.sequences, skip_special_tokens=False)
             
+            first_step_texts = [self._clean_special_tokens_at_end(text) for text in first_step_texts]
+
             first_scores = first_step_output.logits
 
             first_input_length = sample_input_ids.shape[1]
             # 对第一步的每个样本继续生成
             # tolist 第一次为根节点，现在第一次思考为根节点了。
-            for first_step_idx in range(self.num_samples):
+            # modified in range(self.num_samples)
+            for first_step_idx,first_step_text in enumerate(first_step_texts):
                 # 创建根节点
                 score = []
                 for i in range(len(first_scores)):
@@ -262,7 +295,7 @@ class StepGRPOTrainer(Trainer):
 
                 root = ThoughtNode(first_step_texts[first_step_idx], first_step_output[0][first_step_idx], score,first_input_length)
                 all_trees.append(root)
-                
+                r_node.add_child(root)
                 # 初始化当前分支的队列，现在包含节点对象
                 branch_queue = [root]
                 
@@ -272,7 +305,7 @@ class StepGRPOTrainer(Trainer):
                     
                     # 如果当前文本已包含answer或达到最大步数，则生成答案
                     if (ANSWER_STR_START in current_text[len(query_texts):]) or (len(current_text[len(query_texts):].split(THINK_STR_END)) >= self.max_steps) \
-                        or (len(current_text[len(query_texts):]) > 1600):
+                        or (len(current_text[len(query_texts):]) > 1200) or (len(current_text[len(query_texts):].split(THINK_STR_START)) >= self.max_steps):
                         # 生成最终答案
                         if current_text.endswith(ANSWER_STR_START):
                             final_input_ids = self.tokenizer.encode(
@@ -282,7 +315,7 @@ class StepGRPOTrainer(Trainer):
                                 ).to(input_ids.device)
                         else:
                             final_input_ids = self.tokenizer.encode(
-                                current_text + ANSWER_STR_START,
+                                current_text,
                                 return_tensors="pt",
                                 add_special_tokens=False
                             ).to(input_ids.device)
@@ -296,7 +329,9 @@ class StepGRPOTrainer(Trainer):
                             output_logits=True,
                             return_dict_in_generate=True,
                             pad_token_id=self.tokenizer.pad_token_id,
-                            eos_token_id=[self.tokenizer.encode(ANSWER_STR_END,add_special_tokens=False)[0],self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[0]]
+
+                            eos_token_id=[
+                                          self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[-1],151643]
                         )
                         final_scores = final_output.logits
 
@@ -305,6 +340,9 @@ class StepGRPOTrainer(Trainer):
                         # grad_logits = logits[:, :-1, :]
 
                         final_texts = self.tokenizer.batch_decode(final_output.sequences, skip_special_tokens=False)
+                        
+                        final_texts = [self._clean_special_tokens_at_end(text) for text in final_texts]
+
                         final_input_length = final_input_ids.shape[1]
                         # 为每个答案创建叶子节点
                         for sample_num, final_text in enumerate(final_texts):
@@ -320,8 +358,9 @@ class StepGRPOTrainer(Trainer):
                             answer_node.labels = labels
 
                             current_node.add_child(answer_node)
-                        
+
                         continue
+                        
                     
                     # 准备输入
                     if current_text.endswith(THINK_STR_START):
@@ -332,7 +371,7 @@ class StepGRPOTrainer(Trainer):
                         ).to(input_ids.device)
                     else:
                         current_input_ids = self.tokenizer.encode(
-                            current_text+THINK_STR_START,
+                            current_text,
                             return_tensors="pt",
                             add_special_tokens=False
                         ).to(input_ids.device)
@@ -347,17 +386,25 @@ class StepGRPOTrainer(Trainer):
                         output_logits=True,
                         return_dict_in_generate=True,
                         pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=[self.tokenizer.encode(THINK_STR_START,add_special_tokens=False)[0], self.tokenizer.encode(ANSWER_STR_START,add_special_tokens=False)[0],self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[0]]
+                        stopping_criteria=StoppingCriteriaList([
+                            SequenceStoppingCriteria(self.answer_start_sequence)
+                        ]),
+                        eos_token_id=[self.tokenizer.encode(THINK_STR_START,add_special_tokens=False)[-1],
+                              self.tokenizer.encode(self.tokenizer.eos_token,add_special_tokens=False)[-1],151643]
                     )
                     
-                    
+                    if exploration_sample_flag:
+                        # to do list append(exploration_sample_information)
+                        next_outputs.append(exploration_sample[i])
                     # logits = model(next_outputs.sequences).logits
             
                     # grad_logits = logits[:, :-1, :]
 
 
                     next_texts = self.tokenizer.batch_decode(next_outputs.sequences, skip_special_tokens=False)
-
+                    # 清理每个生成文本的末尾特殊token
+                    next_texts = [self._clean_special_tokens_at_end(text) for text in next_texts]
+                    
                     current_scores = next_outputs.logits
                     current_input_length = current_input_ids.shape[1]
                     # 为每个生成的样本创建新节点并加入队列
@@ -373,10 +420,12 @@ class StepGRPOTrainer(Trainer):
                 
                 # 计算损失时遍历树结构
                 def compute_node_value(node, accumulated_outputs=[]):
+                    node.value = 0
+                    node.sample_weight = 0
                     if node.is_answer:
                         # 到达叶子节点，计算整条路径的损失
                         path_text = node.text
-                        path_outputs = accumulated_outputs + [node.output]
+                        # path_outputs = accumulated_outputs + [node.output]
                         steps, answer,others = self._parse_generation(path_text)
                         reward = self.reward_function(steps, answer, others,node.labels) 
                         node.value = reward
@@ -390,54 +439,72 @@ class StepGRPOTrainer(Trainer):
                         return reward
                     
                     else:
-                        # 准备输入
-                        # if node.text.endswith("think"):
-                        #     input_code = node.output
-                        # else:
-                        #     input_text = node.text + "think"
-                        
-                        # input_code = node.output
-                        # # 获取当前节点的输入ID
-                        # input_code_length = len(self.tokenizer.encode(node.text, add_special_tokens=False))
-                        # 获取模型对所有子节点文本的概率输出
-                        # with torch.no_grad():
-                        # node_logits = node.score
-
-                        # node_logits = torch.stack(node_logits, dim=0)
-                        # logits = logits[:, -1, :]  # 获取最后一个token的logits
-                        # node_probs = torch.nn.functional.softmax(node_logits, dim=-1)
-                        
-                        # 计算每个子节点的条件概率并更新value
+                        prob_list = []
                         for child in node.children:
                             # to do 用score 去和logits mask
                             child_logits = child.score
                             child_logits = torch.stack(child_logits, dim=0)
                             child_probs = torch.nn.functional.softmax(child_logits, dim=-1)
 
-                            # child_probs = child_logits 
-                            # child_logits = child.grad_logits
-                            # # child_logits = torch.stack(child_logits, dim=0)
-                            # child_probs = torch.nn.functional.softmax(child_logits, dim=-1)
-
-
-                            # 获取新生成的token的索引
-                            # child_text_ids = self.tokenizer.encode(child.text, add_special_tokens=False)
-                            # new_token_ids = child_text_ids[input_code_length:]
-                            
-                            # 计算序列概率（所有token概率的乘积）
-                            sequence_prob = torch.tensor(0.0).to(input_ids.device)
+                            # 在log空间计算序列概率
+                            sequence_log_prob = torch.tensor(0.0).to(input_ids.device)
                             for i,pos in enumerate(range(child.input_length,child.output.shape[0])):
                                 if child.output[pos]==self.tokenizer.eos_token_id or child.output[pos]==151643:
                                     break
                                 token_id = child.output[pos]
                                 token_prob = child_probs[i, token_id]
-                                # token_prob = child_probs[pos, token_id]
-                                sequence_prob += torch.log(token_prob)
+                                prob_list.append(token_prob)
+                                sequence_log_prob += torch.log(token_prob)
                             
-                            # 更新子节点的value
-                            node.value += torch.exp(sequence_prob) * compute_node_value(child, [])
-                            node.sample_weight += torch.exp(sequence_prob)
-                        node.value = node.value / node.sample_weight
+                            # 计算child_value并保持在log空间
+                            child_value = compute_node_value(child, [])
+                            log_value = sequence_log_prob + torch.log(torch.tensor(child_value + 1e-10))  # 添加小值防止log(0)
+                            
+                            # if torch.isnan(log_value).any() or torch.isinf(log_value).any():
+                            #     print(log_value)
+                            #     raise ValueError("NaN or Inf detected in log_value")
+                            # 收集所有子节点的log空间值
+                            if not hasattr(node, 'log_values'):
+                                node.log_values = []
+                            node.log_values.append(log_value)
+                            
+                            # 累积sample_weight (在log空间)
+                            if not hasattr(node, 'log_weights'):
+                                node.log_weights = []
+                            node.log_weights.append(sequence_log_prob)
+                        
+                        # 使用log-sum-exp技巧计算最终的value
+                        if hasattr(node, 'log_values') and node.log_values:
+                            # 找到最大log值
+                            max_log_value = max(node.log_values)
+                            
+                            # 计算总和（使用log-sum-exp技巧）
+                            log_sum = max_log_value + torch.log(
+                                sum(torch.exp(log_value - max_log_value) 
+                                    for log_value in node.log_values)
+                            )
+                            
+                            # 计算权重和（同样使用log-sum-exp）
+                            max_log_weight = max(node.log_weights)
+                            log_weight_sum = max_log_weight + torch.log(
+                                sum(torch.exp(log_weight - max_log_weight) 
+                                    for log_weight in node.log_weights)
+                            )
+                            
+                            # 计算最终的value
+                            node.value = torch.exp(log_sum - log_weight_sum)
+                            node.sample_weight = torch.exp(log_weight_sum)
+                            
+                            # 清理临时属性
+                            del node.log_values
+                            del node.log_weights
+                        else:
+                            node.value = 0
+                            node.sample_weight = 0
+
+                        if node.value>50 or torch.isnan(node.value).any() or torch.isinf(node.value).any():
+                            print(node.value)
+                            raise ValueError("NaN or Inf detected in value")
                         # 计算当前节点的总损失
                         # total_subtree_loss = sum(child.value for child in node.children)
 
@@ -491,6 +558,10 @@ class StepGRPOTrainer(Trainer):
         
         trees = self.sample_generate_and_adv_cal(model, inputs, num_items_in_batch=num_items_in_batch)
         node_num = 0
+        
+        # rd = np.random.randn(0,1)
+
+        average_loss = 0
         del inputs
         for tree in trees:
             node = tree 
@@ -504,9 +575,12 @@ class StepGRPOTrainer(Trainer):
                 with self.compute_loss_context_manager():
                     # loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
                     node_num += 1
+                    # rd = np.random.randn(0,1)
+                    # if rd > 0.5 and rd < 0.7:
+                    #     continue
+                    # else:
                     loss = self.compute_node_loss(model,node)
-
-                        
+                    average_loss += loss
                     # 或者方式3：同时检查
 
                 # 
@@ -546,11 +620,21 @@ class StepGRPOTrainer(Trainer):
                         loss = loss / self.args.gradient_accumulation_steps
 
                     self.accelerator.backward(loss, **kwargs)
+
+                    for name, param in model.named_parameters():
+                            if param.grad is not None:
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    print(f"Warning: NaN or Inf detected in gradients for {name}")
+                                    print(f"grad stats: min={param.grad.min()}, max={param.grad.max()}")
+                        
+                        # 清除梯度以准备下一次计算
+                        # model.zero_grad()
+                    
             # 在计算完loss后记录到日志文件
                 # 获取当前时间
                 current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 # 记录loss到日志文件
-                self.log_file.write(f"{current_time} - Loss: {loss.detach().item()}\n")
+                self.log_file.write(f"{current_time} - Loss: {loss.detach().cpu().item()}\n")
                 self.log_file.flush()  # 确保立即写入文件
 
             
@@ -561,43 +645,85 @@ class StepGRPOTrainer(Trainer):
         for tree in trees:
             destroy_tree(tree)
         del trees
-        
-        return loss.detach()
+        average_loss = average_loss / node_num
+        return average_loss.detach()
     
     def compute_node_loss(self, model, node):
-        """计算单个节点的损失
+        """计算单个节点的损失，包括策略梯度损失和KL散度
         
         Args:
             model: 模型
             node: 节点
         """
+        # 计算当前模型的logits
         logits_new = model(node.output.view(1,-1)).logits[:,:-1,:]
         probs = torch.nn.functional.softmax(logits_new, dim=-1)
+        
+        # 计算reference模型的logits
+        if self.kl_coef != 0:
+            with torch.no_grad():
+                ref_logits = self.ref_model(node.output.view(1,-1)).logits[:,:-1,:]
+                ref_probs = torch.nn.functional.softmax(ref_logits, dim=-1)
+        
         token_prob_list = []
-        token_prob_olden = []
-        sequence_log_new = torch.tensor(0.0).to(logits_new.device)
+        token_prob_olden_list = []
+        token_prob_ref_list = []
+        # sequence_log_new = torch.tensor(0.0).to(logits_new.device)
+        # kl_div_sum = torch.tensor(0.0).to(logits_new.device)
+        loss_num = 0
+        
+        # sequence_log_ref = torch.tensor(0.0).to(ref_probs.device)
+        # 计算序列概率和KL散度
         for i,pos in enumerate(range(node.input_length-1,node.output.shape[0]-1)):
             if node.output[pos+1]==self.tokenizer.eos_token_id or node.output[pos+1]==151643:
                 break
             token_id = node.output[pos+1]
+            if self.kl_coef != 0:
+                token_prob_ref = ref_probs[0, pos, token_id]
+                token_prob_ref_list.append(torch.log(token_prob_ref))
+                # sequence_log_ref += torch.log(token_prob_ref)
+            # 计算当前token的概率
             token_prob = probs[0, pos, token_id]
-            token_prob_list.append(token_prob)
+            token_prob_list.append(torch.log(token_prob))
             # token_prob = child_probs[pos, token_id]
-            sequence_log_new += torch.log(token_prob)
+            # sequence_log_new += torch.log(token_prob)
         # sequence_log_old = torch.tensor(0.0).to(logits_new.device)
         logits_old = node.score
         logits_old = torch.stack(logits_old, dim=0)
         old_probs = torch.nn.functional.softmax(logits_old, dim=-1)
-        sequence_log_old = torch.tensor(0.0).to(old_probs.device)
+        # sequence_log_old = torch.tensor(0.0).to(old_probs.device)
         for i,pos in enumerate(range(node.input_length,node.output.shape[0])):
             if node.output[pos]==self.tokenizer.eos_token_id or node.output[pos]==151643:
                 break
             token_id = node.output[pos]
             token_prob = old_probs[i, token_id]
-            token_prob_olden.append(token_prob)
-            sequence_log_old += torch.log(token_prob)
-        # 更新子节点的value
-        loss =  - (sequence_log_new - sequence_log_old) * node.advantage
+            token_prob_olden_list.append(torch.log(token_prob))
+            # sequence_log_old += torch.log(token_prob)
+            loss_num += 1
+        if loss_num != 0:
+            ratio_loss = torch.exp(torch.stack(token_prob_list) - torch.stack(token_prob_olden_list)).to(logits_new.device) * node.advantage
+            if self.kl_coef != 0:
+                kl_div_loss = torch.exp(torch.stack(token_prob_ref_list) - torch.stack(token_prob_list)) - \
+                (torch.stack(token_prob_ref_list) - torch.stack(token_prob_list)) - 1
+                loss = - (ratio_loss - self.kl_coef * kl_div_loss.to(logits_new.device))
+            else:
+                loss = - ratio_loss
+            
+            loss = loss.sum(dim=-1) / loss_num
+            # 检查loss是否有nan/inf
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                print("Warning: NaN or Inf detected in loss")
+                # print(f"sequence_log_new: {sequence_log_new}")
+                # print(f"sequence_log_old: {sequence_log_old}")
+                print(f"advantage: {node.advantage}")
+                print(f"loss: {loss}")
+                raise ValueError("NaN or Inf detected in loss")
+        else:
+            loss = torch.tensor(0.0).to(logits_new.device)
+        
+        del token_prob_list
+        del token_prob_olden_list
+        del token_prob_ref_list
 
         return loss
     def _compute_step_loss(self, outputs, step_idx: int, reward: float):
@@ -730,6 +856,39 @@ class StepGRPOTrainer(Trainer):
             print(f"步骤 {idx + 1}: {step}")
         print("\n最终答案:", answer)
 
+    def _clean_special_tokens_at_end(self, text: str) -> str:
+        """清理文本末尾的特殊token
+        
+        Args:
+            text: 需要清理的文本
+            
+        Returns:
+            清理后的文本
+        """
+        # 定义需要清理的特殊token
+        tail_special_tokens = [
+            self.tokenizer.eos_token,
+            '<|im_end|>',
+            '<|im_start|>',
+            '<|endoftext|>',
+        ]
+        
+        # 从最长的特殊token开始检查，避免部分匹配问题
+        tail_special_tokens.sort(key=len, reverse=True)
+        
+        cleaned_text = text
+        while True:
+            original_length = len(cleaned_text)
+            for token in tail_special_tokens:
+                if cleaned_text.strip().endswith(token):
+                    cleaned_text = cleaned_text[:cleaned_text.rstrip().rfind(token)].rstrip()
+            
+            # 如果没有发生变化，说明已经清理完成
+            if len(cleaned_text) == original_length:
+                break
+                
+        return cleaned_text.strip()
+
 def compute_advantage(node):
     """计算树中每个节点的advantage值
     
@@ -774,3 +933,34 @@ def destroy_tree(tree):
         current_node.score = None
         current_node.text = None
         current_node.labels = None
+        current_node.value = 0
+        current_node.advantage = 0  # 添加advantage属性
+        current_node.sample_weight = 0
+        current_node.input_length = 0
+
+
+class SequenceStoppingCriteria(StoppingCriteria):
+    """自定义停止条件：检查最后N个token是否匹配指定序列"""
+    
+    def __init__(self, stop_token_sequence):
+        """
+        Args:
+            stop_token_sequence: 停止序列的token列表
+        """
+        self.stop_token_sequence = torch.tensor(stop_token_sequence)
+        self.sequence_length = len(stop_token_sequence)
+    
+    def __call__(self, input_ids, scores, **kwargs):
+        # 获取每个序列最后N个token，N是停止序列的长度
+        last_tokens = input_ids[:, -self.sequence_length:]
+        
+        # 如果生成的token数量不够，返回False
+        if last_tokens.shape[1] < self.sequence_length:
+            return torch.zeros(input_ids.shape[0], dtype=torch.bool)
+        
+        # 将停止序列移到正确的设备上
+        stop_sequence = self.stop_token_sequence.to(input_ids.device)
+        
+        # 检查是否匹配停止序列
+        matches = (last_tokens == stop_sequence).all(dim=1)
+        return matches
