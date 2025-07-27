@@ -1,0 +1,11 @@
+[Unit]
+Description=Training Service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /path/to/your_script.py
+Restart=always
+User=your_username
+
+[Install]
+WantedBy=multi-user.target 

@@ -1,0 +1,73 @@
+  163  ./run_training_lora.sh 
+  182  ./run_training_lora.sh 
+  206  ./run_training_lora.sh 
+  261  ./run_training_lora.sh 
+  290  ./run_training_lora.sh 
+  316  ./run_training_lora.sh 
+  338  ./run_training_lora.sh 
+  348  ./run_training_lora.sh 
+  380  ./run_training_lora.sh 
+  382  sudo ./run_training_lora.sh 
+  384  ./run_training_lora.sh 
+  386  ./run_training_lora.sh 
+  401  vi run_training_lora.sh 
+  418  cat ~/LLM_RL/instruct_fine_tuning/run_training_lora.sh
+  421  cat ~/LLM_RL/instruct_fine_tuning/run_training_lora.sh
+  427  ~/LLM_RL/instruct_fine_tuning/run_training_lora.sh
+  430  ~/LLM_RL/instruct_fine_tuning/run_training_lora.sh
+  436  ./run_training_lora.sh
+  437  ./run_training_lora.sh 
+  438  vi run_training_lora.sh 
+  440  ./run_training_lora.sh 
+  443  ./run_training_lora.sh 
+  451  ~/LLM_RL/instruct_fine_tuning/run_training_lora.sh
+  457  ./run_training_lora.sh 
+  464  ./run_training_lora.sh 
+  483  ./run_training_lora.sh 
+  484  vi ./run_training_lora.sh
+  488  ./run_training_lora.sh 
+  504  vi ./run_training_lora.sh
+  572  vim run_training_lora.sh 
+  573  sh run_training_lora.sh 
+  604  sh run_training_lora.sh 
+  610  sh run_training_lora.sh 
+  628  cat run_training_lora.sh 
+  634  ./run_training_lora.sh 
+  638  ./run_training_lora.sh 
+  640  cat run_training_lora.sh 
+  641  vim run_training_lora.sh 
+  642  cp run_training_lora.sh run_training_lora.sh_bak
+  644  vim run_training_lora.sh 
+  645  ./run_training_lora.sh
+  647  ./run_training_lora.sh
+  650  ./run_training_lora.sh
+  683  sh run_training_lora.sh 
+  686  sh run_training_lora.sh 
+  699  vim run_training_lora.sh 
+  703  vim run_training_lora.sh 
+  705  vim run_training_lora.sh_bak 
+  707  sh run_training_lora.sh 
+  709  vim run_training_lora.sh
+  718  sh run_training_lora.sh 
+  738  sh run_training_lora.sh 
+  744  sh run_training_lora.sh 
+  747  vim run_training_lora.sh 
+  777  vim run_training_lora.sh 
+  784  sh run_training_lora.sh 
+  786  vim run_training_lora.sh 
+  788  sh run_training_lora.sh 
+  817  cat run_training_lora.sh
+  854  ./run_training_lora.sh 
+  928  ./run_training_lora.sh 
+  961  ./run_training_lora.sh 
+  978  ./run_training_lora.sh 
+ 1001  ./run_training_lora.sh 
+ 1010  ./run_training_lora.sh 
+ 1053  vi run_training_lora.sh 
+ 1054  cp run_training_lora.sh run_training_lora.sh.bak-0414
+ 1055  vi run_training_lora.sh 
+ 1071  ./run_training_lora.sh
+ 1086  ./run_training_lora.sh
+ 1117  vi run_training_lora.sh
+ 1119  history | grep run_train
+ 1120  history | grep run_train > 1.txt

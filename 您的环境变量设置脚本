@@ -1,0 +1,8 @@
+export TORCH_CUDA_ARCH_LIST="8.6"
+# 注释掉或删除 DS_BUILD_FUSED_ADAM
+# export DS_BUILD_FUSED_ADAM=1
+# 设置 CUDA 12.4 的路径
+export CUDA_HOME=/usr/local/cuda-12.4
+export PATH=$CUDA_HOME/bin:$PATH
+# 添加所有必要的系统库路径
+export LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/local/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH 

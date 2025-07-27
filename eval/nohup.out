@@ -1,0 +1,9 @@
+正在加载模型...
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:01<00:05,  1.80s/it]Loading checkpoint shards:  50%|█████     | 2/4 [00:03<00:03,  1.78s/it]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:05<00:01,  1.73s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:06<00:00,  1.62s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:06<00:00,  1.67s/it]
+正在加载测试数据集...
+Traceback (most recent call last):
+  File "/9950backfile/liguoqi/wangzihang/LLM_RL/eval/model_evaluation.py", line 188, in <module>
+    evaluate_model(MODEL_PATH, TEST_DATASET_PATH, tokenizer_path) 
+  File "/9950backfile/liguoqi/wangzihang/LLM_RL/eval/model_evaluation.py", line 110, in evaluate_model
+    with open(test_file_path, 'r', encoding='utf-8') as f:
+FileNotFoundError: [Errno 2] No such file or directory: './dataset/test.jsonl'

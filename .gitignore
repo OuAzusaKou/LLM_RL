@@ -1,10 +1,38 @@
-*
+# 排除所有文件
 
-trl_grpo/
-!*.py
 
-# 保留Python代码文件
+trl_grpo/*
+！trl_grpo/*.py
+# 保留所有Python文件（包括子目录中的）
 !*.py
+!**/*.py
+*.json
+*.png
+*.pt
+*.pth
+*.pkl.gz
+*.pkl.bz2
+*.pkl.zip
+*.pkl.tar
+*.log
+wandb/
+verl_grpo/
+
+instruct_fine_tuning/*
+!instruct_fine_tuning/*.py
+!instruct_fine_tuning/*.sh
+!instruct_fine_tuning/*.md
+!instruct_fine_tuning/*.txt
+
+dataset/*
+!dataset/*.py
+
+checkpoint*/
+qwen_instruct_lora_finetuned_unbalanced/
+
+
+
+# 保留配置文件
 !requirements.txt
 !pyproject.toml
 !setup.py
@@ -12,4 +40,8 @@ trl_grpo/
 !MANIFEST.in
 !README.md
 !LICENSE
-!.gitignore 
+!.gitignore
+
+# 保留shell脚本
+!*.sh
+!**/*.sh
