@@ -1,0 +1,15 @@
+*
+
+trl_grpo/
+!*.py
+
+# 保留Python代码文件
+!*.py
+!requirements.txt
+!pyproject.toml
+!setup.py
+!setup.cfg
+!MANIFEST.in
+!README.md
+!LICENSE
+!.gitignore 

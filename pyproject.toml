@@ -1,0 +1,7 @@
+[options]
+install_requires = [
+    "package_name"
+]
+exclude_package_data = {
+    "": ["some_dependency*"]
+} 

@@ -1,0 +1,2 @@
+package_name
+!some_dependency  # 排除这个包 
